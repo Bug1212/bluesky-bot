@@ -4,6 +4,7 @@ import os
 import json
 import httpx
 import random
+import re
 import time
 from groq import Groq
 from dotenv import load_dotenv
@@ -14,8 +15,9 @@ load_dotenv()
 # CONFIG
 # ============================================================
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-BSKY_HANDLE     = os.environ.get("BSKY_HANDLE", "")      # e.g. yourname.bsky.social
-BSKY_APP_PASS   = os.environ.get("BSKY_APP_PASS", "")    # e.g. xxxx-xxxx-xxxx-xxxx
+BSKY_HANDLE     = os.environ.get("BSKY_HANDLE", "")
+BSKY_APP_PASS   = os.environ.get("BSKY_APP_PASS", "")
+HF_API_KEY      = os.environ.get("HF_API_KEY", "")   # Free at huggingface.co — add to .env
 
 BSKY_API        = "https://bsky.social/xrpc"
 POSTED_FILE     = "bluesky_posted_links.json"
@@ -64,11 +66,16 @@ def save_posted_links(links):
     with open(POSTED_FILE, "w") as f:
         json.dump(links, f)
 
+def clean_prompt(prompt: str) -> str:
+    """Sanitize prompt — remove special chars, limit to 100 chars."""
+    prompt = re.sub(r"[^a-zA-Z0-9 .,]", " ", prompt)
+    prompt = re.sub(r"\s+", " ", prompt).strip()
+    return prompt[:100]
+
 # ============================================================
-# BLUESKY AUTH — get session token
+# BLUESKY AUTH
 # ============================================================
 async def bsky_login(client: httpx.AsyncClient):
-    """Login to Bluesky and return access token + DID."""
     response = await client.post(
         f"{BSKY_API}/com.atproto.server.createSession",
         json={"identifier": BSKY_HANDLE, "password": BSKY_APP_PASS}
@@ -81,7 +88,6 @@ async def bsky_login(client: httpx.AsyncClient):
 # BLUESKY — upload image blob
 # ============================================================
 async def bsky_upload_image(client: httpx.AsyncClient, token: str, image_bytes: bytes):
-    """Upload image to Bluesky and return blob reference."""
     response = await client.post(
         f"{BSKY_API}/com.atproto.repo.uploadBlob",
         headers={
@@ -98,7 +104,6 @@ async def bsky_upload_image(client: httpx.AsyncClient, token: str, image_bytes: 
 # ============================================================
 async def bsky_post(client: httpx.AsyncClient, token: str, did: str,
                     text: str, image_bytes=None, reply_ref=None):
-    """Create a single Bluesky post, optionally with image and reply."""
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     record = {
@@ -108,7 +113,6 @@ async def bsky_post(client: httpx.AsyncClient, token: str, did: str,
         "langs": ["en"]
     }
 
-    # Attach image if provided
     if image_bytes:
         try:
             blob = await bsky_upload_image(client, token, image_bytes)
@@ -119,7 +123,6 @@ async def bsky_post(client: httpx.AsyncClient, token: str, did: str,
         except Exception as e:
             print(f"⚠️ Image upload error: {e}")
 
-    # Thread reply reference
     if reply_ref:
         record["reply"] = reply_ref
 
@@ -142,12 +145,10 @@ async def bsky_post(client: httpx.AsyncClient, token: str, did: str,
 async def bsky_post_thread(client: httpx.AsyncClient, token: str, did: str,
                             main_text: str, replies: list,
                             link: str, hashtags: list, image_bytes=None):
-    """Post main + thread replies on Bluesky."""
     print("🧵 Posting as thread...")
 
-    # Main post with image
     uri, cid = await bsky_post(client, token, did, main_text, image_bytes=image_bytes)
-    print(f"✅ Main post done!")
+    print("✅ Main post done!")
 
     root_ref = {"root": {"uri": uri, "cid": cid}, "parent": {"uri": uri, "cid": cid}}
     parent_uri, parent_cid = uri, cid
@@ -155,7 +156,6 @@ async def bsky_post_thread(client: httpx.AsyncClient, token: str, did: str,
     for i, reply_text in enumerate(replies):
         await asyncio.sleep(2)
 
-        # Last reply gets link + hashtags
         if i == len(replies) - 1:
             tags = " ".join(hashtags)
             reply_text = f"{reply_text}\n\n🔗 {link}\n\n{tags}"
@@ -177,7 +177,6 @@ async def bsky_post_thread(client: httpx.AsyncClient, token: str, did: str,
 # GROQ — generate post content
 # ============================================================
 def generate_content(title: str, description: str, niche: str):
-    """Returns main_post text, thread replies, and image prompt."""
     client = Groq(api_key=GROQ_API_KEY)
     style  = NICHE_STYLE[niche]
 
@@ -192,8 +191,9 @@ def generate_content(title: str, description: str, niche: str):
                     "Start with an emoji. Make it curiosity-driven. No hashtags.\n"
                     "2. 'thread': list of exactly 3 follow-up posts that tell the full story. "
                     "Each under 280 chars. Add 1-2 emojis per post. No hashtags.\n"
-                    "3. 'image_prompt': vivid image generation prompt matching the article. "
-                    "End with 'digital art, 4k, cinematic lighting'.\n"
+                    "3. 'image_prompt': short vivid image prompt under 80 chars. "
+                    "Plain English words only. No special characters or quotes. "
+                    "End with 'digital art 4k'.\n"
                     "Respond with JSON only. No extra text."
                 )
             },
@@ -214,28 +214,109 @@ def generate_content(title: str, description: str, niche: str):
         data   = json.loads(raw)
         main   = data.get("main_post", f"{style['emoji']} {title[:240]}")
         thread = data.get("thread", [])
-        prompt = data.get("image_prompt", f"{niche} technology news, digital art, 4k")
+        prompt = data.get("image_prompt", f"{niche} technology news digital art 4k")
     except Exception:
         main   = f"{style['emoji']} {title[:240]}"
         thread = []
-        prompt = f"{niche} technology concept, digital art, 4k, cinematic lighting"
+        prompt = f"{niche} technology concept digital art 4k"
 
     return main, thread, prompt
 
 # ============================================================
-# IMAGE — Pollinations.AI (free)
+# IMAGE — Method 1: Hugging Face SDXL (FREE, best quality)
+# Get free key: https://huggingface.co/settings/tokens
+# Add to .env: HF_API_KEY=hf_xxxxxxxxxxxx
 # ============================================================
-async def generate_image(prompt: str):
-    try:
-        encoded  = prompt.replace(" ", "%20").replace(",", "%2C")
-        url      = f"https://image.pollinations.ai/prompt/{encoded}?width=1200&height=675&nologo=true"
+async def generate_image_hf(prompt: str):
+    if not HF_API_KEY:
+        print("   ⏭️  Skipping HF (no HF_API_KEY in .env)")
+        return None
 
+    url     = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {"inputs": clean_prompt(prompt)}
+
+    try:
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.get(url, follow_redirects=True)
-            if response.status_code == 200:
+            print("   🤗 Trying Hugging Face (SDXL)...")
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code == 503:
+                print("   ⏳ Model loading, waiting 20s and retrying...")
+                await asyncio.sleep(20)
+                response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code == 200 and len(response.content) > 5000:
+                print("   ✅ Hugging Face success!")
+                return response.content
+
+            print(f"   ⚠️ HF failed: status={response.status_code}")
+    except Exception as e:
+        print(f"   ⚠️ HF error: {e}")
+    return None
+
+# ============================================================
+# IMAGE — Method 2: Pollinations with Flux model (no key needed)
+# ============================================================
+async def generate_image_pollinations(prompt: str):
+    safe    = clean_prompt(prompt)
+    encoded = safe.replace(" ", "%20").replace(",", "%2C")
+    seed    = random.randint(1, 99999)
+    # Use flux model which is more reliable than default
+    url     = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=576&nologo=true&seed={seed}&model=flux"
+
+    try:
+        async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+            print("   🌸 Trying Pollinations (Flux)...")
+            response = await client.get(url)
+            size = len(response.content)
+            if response.status_code == 200 and size > 5000:
+                print("   ✅ Pollinations success!")
+                return response.content
+            print(f"   ⚠️ Pollinations failed: status={response.status_code}, size={size}")
+    except Exception as e:
+        print(f"   ⚠️ Pollinations error: {e}")
+    return None
+
+# ============================================================
+# IMAGE — Method 3: Picsum placeholder (always works, no AI)
+# ============================================================
+async def generate_image_placeholder():
+    seed = random.randint(1, 500)
+    url  = f"https://picsum.photos/seed/{seed}/1200/675"
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            print("   🖼️  Trying Picsum placeholder fallback...")
+            response = await client.get(url)
+            if response.status_code == 200 and len(response.content) > 5000:
+                print("   ✅ Placeholder image ready!")
                 return response.content
     except Exception as e:
-        print(f"⚠️ Image error: {e}")
+        print(f"   ⚠️ Placeholder error: {e}")
+    return None
+
+# ============================================================
+# IMAGE — Orchestrator: tries all methods in order
+# ============================================================
+async def generate_image(prompt: str):
+    print(f"   📝 Clean prompt: {clean_prompt(prompt)}")
+
+    # 1. Best quality: Hugging Face (needs free HF_API_KEY in .env)
+    image = await generate_image_hf(prompt)
+    if image:
+        return image
+
+    # 2. Fallback: Pollinations Flux
+    image = await generate_image_pollinations(prompt)
+    if image:
+        return image
+
+    # 3. Last resort: random photo placeholder
+    image = await generate_image_placeholder()
+    if image:
+        return image
+
+    print("   ❌ All image methods failed — posting text only")
     return None
 
 # ============================================================
@@ -249,10 +330,13 @@ async def run_bluesky_bot():
         print("❌ Bluesky credentials missing! Check your .env file.")
         return
 
+    if not HF_API_KEY:
+        print("⚠️  Tip: Add HF_API_KEY to .env for AI-generated images.")
+        print("   Free key at: https://huggingface.co/settings/tokens\n")
+
     posted_links     = get_posted_links()
     articles_to_post = []
 
-    # Collect 1 fresh article per niche
     for niche, feed_urls in FEEDS.items():
         found = False
         for feed_url in feed_urls:
@@ -279,7 +363,6 @@ async def run_bluesky_bot():
         print("🟡 No new articles found.")
         return
 
-    # Login to Bluesky once
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             token, did = await bsky_login(client)
@@ -288,7 +371,6 @@ async def run_bluesky_bot():
             print(f"❌ Bluesky login failed: {e}")
             return
 
-        # Post max 2 articles
         for niche, article in articles_to_post[:2]:
             title       = article.title
             link        = article.link
@@ -297,7 +379,6 @@ async def run_bluesky_bot():
 
             print(f"\n📰 [{niche.upper()}] {title}")
 
-            # 1. Generate content
             try:
                 main_post, thread, image_prompt = generate_content(title, description, niche)
                 print("✅ Content generated")
@@ -305,14 +386,12 @@ async def run_bluesky_bot():
                 print(f"⚠️ Groq error: {e}")
                 main_post    = f"{style['emoji']} {title[:240]}"
                 thread       = []
-                image_prompt = f"{niche} technology, digital art, 4k"
+                image_prompt = f"{niche} technology digital art 4k"
 
-            # 2. Generate image
             print("🖼️  Generating image...")
             image_bytes = await generate_image(image_prompt)
             print("✅ Image ready!" if image_bytes else "⚠️ No image — text only")
 
-            # 3. Mix: randomly post as thread or single post
             try:
                 if thread and random.choice([True, False]):
                     await bsky_post_thread(
